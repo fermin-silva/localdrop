@@ -14,7 +14,16 @@ import (
 	"github.com/mdp/qrterminal/v3"
 )
 
-const downloadDir = "localdrop_downloads"
+var downloadDir string
+
+func init() {
+	exe, err := os.Executable()
+	if err != nil {
+		downloadDir = "localdrop_downloads"
+		return
+	}
+	downloadDir = filepath.Join(filepath.Dir(exe), "localdrop_downloads")
+}
 
 const uploadHTML = `<!DOCTYPE html>
 <html lang="en">
