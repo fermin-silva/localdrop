@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            name: localdrop-linux-amd64
+          - goos: linux
+            goarch: arm64
+            name: localdrop-linux-arm64
+          - goos: darwin
+            goarch: amd64
+            name: localdrop-darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            name: localdrop-darwin-arm64
+          - goos: windows
+            goarch: amd64
+            name: localdrop-windows-amd64
+
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          binary="localdrop"
+          if [ "$GOOS" = "windows" ]; then
+            binary="localdrop.exe"
+          fi
+          go build -ldflags="-s -w" -o "$binary" .
+
+      - name: Package
+        run: |
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip "${{ matrix.name }}.zip" localdrop.exe
+          else
+            tar czf "${{ matrix.name }}.tar.gz" localdrop
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            *.zip
+            *.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            *.tar.gz
+            *.zip
