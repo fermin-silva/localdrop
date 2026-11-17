@@ -1,13 +1,18 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -66,12 +71,16 @@ button:disabled { background: #aaa; }
 <div id="progress-wrap"><progress id="progress-bar" value="0" max="100"></progress></div>
 <div id="status"></div>
 <script>
+const CHUNK = 32 * 1024 * 1024;
+const MAX_RETRIES = 8;
 const file = document.getElementById('file');
 const lbl = document.getElementById('lbl');
 const btn = document.getElementById('btn');
 const bar = document.getElementById('progress-bar');
 const pw = document.getElementById('progress-wrap');
 const st = document.getElementById('status');
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 file.addEventListener('change', () => {
   if (file.files.length > 0) {
@@ -81,13 +90,72 @@ file.addEventListener('change', () => {
   }
 });
 
-document.getElementById('f').addEventListener('submit', (e) => {
+// api resolves with {status, data} for any HTTP response and rejects on network errors.
+function api(method, url, body, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(method, url);
+    if (onProgress) xhr.upload.onprogress = onProgress;
+    xhr.onload = () => {
+      let data = {};
+      try { data = JSON.parse(xhr.responseText); } catch (e) {}
+      resolve({ status: xhr.status, data: data, text: xhr.responseText });
+    };
+    xhr.onerror = () => reject(new Error('Network error'));
+    xhr.send(body);
+  });
+}
+
+async function upload(f) {
+  const q = new URLSearchParams({ name: f.name, size: f.size, mtime: f.lastModified });
+  let id = null, offset = 0, done = false, fails = 0;
+  while (!done) {
+    try {
+      if (id === null) {
+        const r = await api('POST', '/upload/init?' + q);
+        if (r.status !== 200) throw Object.assign(new Error(r.text), { fatal: r.status < 500 });
+        id = r.data.id;
+        offset = r.data.offset;
+        done = r.data.done;
+        if (offset > 0) st.textContent = 'Resuming from ' + Math.round(offset / 1e6) + ' MB...';
+        bar.value = f.size ? (offset / f.size) * 100 : 0;
+        continue;
+      }
+      const end = Math.min(offset + CHUNK, f.size);
+      const base = offset;
+      const r = await api('PUT', '/upload/chunk?id=' + id + '&offset=' + offset, f.slice(offset, end), (ev) => {
+        if (ev.lengthComputable) bar.value = ((base + ev.loaded) / f.size) * 100;
+      });
+      if (r.status === 200) {
+        offset = r.data.offset;
+        done = r.data.done;
+        fails = 0;
+        st.textContent = 'Uploading... do not leave or lock this page.';
+      } else if (r.status === 409) {
+        offset = r.data.offset; // server is the source of truth
+      } else if (r.status === 404) {
+        id = null; // server forgot this upload, re-init
+      } else {
+        throw Object.assign(new Error(r.text), { fatal: r.status < 500 && r.status !== 423 });
+      }
+    } catch (err) {
+      if (err.fatal || ++fails > MAX_RETRIES) throw err;
+      st.textContent = 'Connection problem, retrying (' + fails + '/' + MAX_RETRIES + ')...';
+      await sleep(Math.min(1000 * 2 ** (fails - 1), 10000));
+      if (id !== null) {
+        try {
+          const r = await api('GET', '/upload/offset?id=' + id);
+          if (r.status === 200) offset = r.data.offset;
+        } catch (e) {}
+      }
+    }
+  }
+}
+
+document.getElementById('f').addEventListener('submit', async (e) => {
   e.preventDefault();
   if (!file.files.length) return;
-  const fd = new FormData();
-  fd.append('file', file.files[0]);
-  const xhr = new XMLHttpRequest();
-  xhr.open('POST', '/upload');
+  const f = file.files[0];
   pw.style.display = 'block';
   btn.disabled = true;
   st.className = '';
@@ -96,34 +164,22 @@ document.getElementById('f').addEventListener('submit', (e) => {
   if (navigator.wakeLock) {
     navigator.wakeLock.request('screen').then(l => wakeLock = l).catch(() => {});
   }
-  xhr.upload.onprogress = (ev) => {
-    if (ev.lengthComputable) bar.value = (ev.loaded / ev.total) * 100;
-  };
-  const releaseWake = () => { if (wakeLock) { wakeLock.release(); wakeLock = null; } };
-  xhr.onload = () => {
-    releaseWake();
-    if (xhr.status === 200) {
-      st.className = 'ok';
-      st.textContent = 'Upload complete!';
-      file.value = '';
-      lbl.textContent = 'Tap here to choose a file';
-      lbl.classList.remove('has-file');
-    } else {
-      st.className = 'err';
-      st.textContent = 'Upload failed: ' + xhr.responseText;
-    }
-    pw.style.display = 'none';
-    bar.value = 0;
-    btn.disabled = false;
-  };
-  xhr.onerror = () => {
-    releaseWake();
+  try {
+    await upload(f);
+    st.className = 'ok';
+    st.textContent = 'Upload complete!';
+    file.value = '';
+    lbl.textContent = 'Tap here to choose a file';
+    lbl.classList.remove('has-file');
+  } catch (err) {
     st.className = 'err';
-    st.textContent = 'Network error';
-    pw.style.display = 'none';
+    st.textContent = 'Upload failed: ' + err.message + ' (select the same file again to resume)';
     btn.disabled = false;
-  };
-  xhr.send(fd);
+  }
+  if (wakeLock) wakeLock.release();
+  pw.style.display = 'none';
+  bar.value = 0;
+  btn.disabled = !file.files.length;
 });
 </script>
 </body>
@@ -219,75 +275,182 @@ func (pw *progressWriter) stop() {
 	close(pw.done)
 }
 
-func handleUpload(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+const chunkSize = 32 << 20
 
-	mr, err := r.MultipartReader()
-	if err != nil {
-		http.Error(w, "invalid multipart request", http.StatusBadRequest)
+type upload struct {
+	id   string
+	name string
+	size int64
+	mu   sync.Mutex // held while a chunk is being written
+}
+
+var (
+	uploadsMu sync.Mutex
+	uploads   = map[string]*upload{}
+)
+
+func (u *upload) partPath() string {
+	return filepath.Join(downloadDir, u.id+".part")
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
+}
+
+func getUpload(id string) *upload {
+	uploadsMu.Lock()
+	defer uploadsMu.Unlock()
+	return uploads[id]
+}
+
+// finish moves the completed temp file to its final, non-colliding name.
+func (u *upload) finish() error {
+	finalPath := uniquePath(downloadDir, u.name)
+	if err := os.Rename(u.partPath(), finalPath); err != nil {
+		return err
+	}
+	uploadsMu.Lock()
+	delete(uploads, u.id)
+	uploadsMu.Unlock()
+	fmt.Printf("Saved: %s (%.1f MB)\n", finalPath, float64(u.size)/1_000_000)
+	return nil
+}
+
+// handleInit starts an upload, or resumes it if the same file (name, size, mtime)
+// was already partially received.
+func handleInit(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	name := filepath.Base(q.Get("name"))
+	size, err := strconv.ParseInt(q.Get("size"), 10, 64)
+	if name == "." || name == string(filepath.Separator) || err != nil || size < 0 {
+		http.Error(w, "invalid name or size", http.StatusBadRequest)
 		return
 	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%d|%s", name, size, q.Get("mtime"))))
+	id := hex.EncodeToString(sum[:16])
 
 	if err := os.MkdirAll(downloadDir, 0755); err != nil {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
 
-	for {
-		part, err := mr.NextPart()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			http.Error(w, "error reading upload", http.StatusBadRequest)
-			return
-		}
+	uploadsMu.Lock()
+	u := uploads[id]
+	if u == nil {
+		u = &upload{id: id, name: name, size: size}
+		uploads[id] = u
+	}
+	uploadsMu.Unlock()
 
-		filename := part.FileName()
-		if filename == "" {
-			continue
-		}
-		// Sanitize: use only the base name
-		filename = filepath.Base(filename)
+	if !u.mu.TryLock() {
+		http.Error(w, "upload in progress", http.StatusLocked)
+		return
+	}
+	defer u.mu.Unlock()
 
-		pendingPath := filepath.Join(downloadDir, "pending_"+filename)
-		f, err := os.Create(pendingPath)
-		if err != nil {
+	f, err := os.OpenFile(u.partPath(), os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	fi, err := f.Stat()
+	f.Close()
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	offset := fi.Size()
+	if offset > size { // stale part file from a different upload; start over
+		offset = 0
+		if err := os.Truncate(u.partPath(), 0); err != nil {
 			http.Error(w, "server error", http.StatusInternalServerError)
 			return
 		}
-
-		pw := newProgressWriter(f, filename)
-		start := time.Now()
-		n, err := io.Copy(pw, part)
-		pw.stop()
-		f.Close()
-		if err != nil {
-			os.Remove(pendingPath)
-			http.Error(w, "error saving file", http.StatusInternalServerError)
-			return
-		}
-
-		elapsed := time.Since(start).Seconds()
-		avgMbps := 0.0
-		if elapsed > 0 {
-			avgMbps = float64(n) * 8 / elapsed / 1_000_000
-		}
-
-		finalPath := uniquePath(downloadDir, filename)
-		if err := os.Rename(pendingPath, finalPath); err != nil {
+	}
+	done := offset == size
+	if done {
+		if err := u.finish(); err != nil {
 			http.Error(w, "error finalizing file", http.StatusInternalServerError)
 			return
 		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": id, "offset": offset, "done": done})
+}
 
-		fmt.Printf("Saved: %s (%.1f MB, %.1f Mbps avg, %.1fs)\n", finalPath, float64(n)/1_000_000, avgMbps, elapsed)
+func handleOffset(w http.ResponseWriter, r *http.Request) {
+	u := getUpload(r.URL.Query().Get("id"))
+	if u == nil {
+		http.Error(w, "unknown upload", http.StatusNotFound)
+		return
+	}
+	fi, err := os.Stat(u.partPath())
+	if err != nil {
+		http.Error(w, "unknown upload", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"offset": fi.Size()})
+}
+
+// handleChunk appends the request body to the temp file. The offset must equal the
+// bytes already on disk, so chunks can never overlap or leave gaps.
+func handleChunk(w http.ResponseWriter, r *http.Request) {
+	u := getUpload(r.URL.Query().Get("id"))
+	if u == nil {
+		http.Error(w, "unknown upload", http.StatusNotFound)
+		return
+	}
+	offset, err := strconv.ParseInt(r.URL.Query().Get("offset"), 10, 64)
+	if err != nil {
+		http.Error(w, "invalid offset", http.StatusBadRequest)
+		return
+	}
+	if !u.mu.TryLock() { // a previous request for this upload is still winding down
+		http.Error(w, "upload in progress", http.StatusLocked)
+		return
+	}
+	defer u.mu.Unlock()
+
+	f, err := os.OpenFile(u.partPath(), os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		http.Error(w, "unknown upload", http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	cur := fi.Size()
+	if offset != cur {
+		writeJSON(w, http.StatusConflict, map[string]any{"offset": cur})
+		return
+	}
+	if r.ContentLength < 0 || r.ContentLength > chunkSize || cur+r.ContentLength > u.size {
+		http.Error(w, "invalid chunk length", http.StatusBadRequest)
+		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, "OK")
+	pw := newProgressWriter(f, u.name)
+	n, err := io.Copy(pw, http.MaxBytesReader(w, r.Body, r.ContentLength))
+	pw.stop()
+	if err != nil || n != r.ContentLength {
+		// Whatever reached the disk stays; the client re-queries the offset and continues.
+		http.Error(w, "error saving chunk", http.StatusInternalServerError)
+		return
+	}
+
+	done := cur+n == u.size
+	if done {
+		f.Close()
+		if err := u.finish(); err != nil {
+			http.Error(w, "error finalizing file", http.StatusInternalServerError)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"offset": cur + n, "done": done})
 }
 
 func main() {
@@ -323,7 +486,9 @@ func main() {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprint(w, uploadHTML)
 	})
-	http.HandleFunc("/upload", handleUpload)
+	http.HandleFunc("POST /upload/init", handleInit)
+	http.HandleFunc("GET /upload/offset", handleOffset)
+	http.HandleFunc("PUT /upload/chunk", handleChunk)
 
 	if err := http.Serve(listener, nil); err != nil {
 		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
