@@ -54,39 +54,46 @@ button {
   background: #4caf50; color: #fff; border: none; border-radius: 8px; cursor: pointer;
 }
 button:disabled { background: #aaa; }
-#progress-wrap { display: none; margin-top: 16px; }
-#progress-bar { width: 100%; height: 24px; border-radius: 8px; }
+#list { max-width: 400px; margin: 16px auto 0; }
+.item { background: #fff; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+.item .name { font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item progress { width: 100%; height: 12px; margin-top: 6px; }
+.item .st { font-size: 13px; color: #666; margin-top: 4px; }
 #status { text-align: center; margin-top: 16px; font-size: 16px; }
 .ok { color: #4caf50; } .err { color: #e53935; }
 </style>
 </head>
 <body>
 <h1>LocalDrop</h1>
-<p class="sub">Tap the box below to pick a file, then upload it.</p>
+<p class="sub">Tap the box below to pick one or more files, then upload them.</p>
 <form id="f">
-  <label class="file-box" id="lbl" for="file">Tap here to choose a file</label>
-  <input type="file" id="file" name="file" accept="*/*">
+  <label class="file-box" id="lbl" for="file">Tap here to choose files</label>
+  <input type="file" id="file" name="file" accept="*/*" multiple>
   <button type="submit" id="btn" disabled>Upload</button>
 </form>
-<div id="progress-wrap"><progress id="progress-bar" value="0" max="100"></progress></div>
+<div id="list"></div>
 <div id="status"></div>
 <script>
 const CHUNK = 32 * 1024 * 1024;
 const MAX_RETRIES = 8;
+const PARALLEL = 3; // files uploaded at the same time; chunks within a file stay sequential
 const file = document.getElementById('file');
 const lbl = document.getElementById('lbl');
 const btn = document.getElementById('btn');
-const bar = document.getElementById('progress-bar');
-const pw = document.getElementById('progress-wrap');
+const list = document.getElementById('list');
 const st = document.getElementById('status');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const fileKey = (f) => f.name + '|' + f.size + '|' + f.lastModified;
+const completed = new Set(); // files already saved, so a retry doesn't upload them again
+let busy = false;
 
 file.addEventListener('change', () => {
   if (file.files.length > 0) {
-    lbl.textContent = file.files[0].name;
+    const n = file.files.length;
+    lbl.textContent = n === 1 ? file.files[0].name : n + ' files selected';
     lbl.classList.add('has-file');
-    btn.disabled = false;
+    btn.disabled = busy;
   }
 });
 
@@ -106,7 +113,7 @@ function api(method, url, body, onProgress) {
   });
 }
 
-async function upload(f) {
+async function upload(f, bar, say) {
   const q = new URLSearchParams({ name: f.name, size: f.size, mtime: f.lastModified });
   let id = null, offset = 0, done = false, fails = 0;
   while (!done) {
@@ -117,7 +124,7 @@ async function upload(f) {
         id = r.data.id;
         offset = r.data.offset;
         done = r.data.done;
-        if (offset > 0) st.textContent = 'Resuming from ' + Math.round(offset / 1e6) + ' MB...';
+        if (offset > 0) say('Resuming from ' + Math.round(offset / 1e6) + ' MB...');
         bar.value = f.size ? (offset / f.size) * 100 : 0;
         continue;
       }
@@ -130,7 +137,7 @@ async function upload(f) {
         offset = r.data.offset;
         done = r.data.done;
         fails = 0;
-        st.textContent = 'Uploading... do not leave or lock this page.';
+        say('Uploading...');
       } else if (r.status === 409) {
         offset = r.data.offset; // server is the source of truth
       } else if (r.status === 404) {
@@ -140,7 +147,7 @@ async function upload(f) {
       }
     } catch (err) {
       if (err.fatal || ++fails > MAX_RETRIES) throw err;
-      st.textContent = 'Connection problem, retrying (' + fails + '/' + MAX_RETRIES + ')...';
+      say('Connection problem, retrying (' + fails + '/' + MAX_RETRIES + ')...');
       await sleep(Math.min(1000 * 2 ** (fails - 1), 10000));
       if (id !== null) {
         try {
@@ -152,11 +159,36 @@ async function upload(f) {
   }
 }
 
+function addRow(f) {
+  const row = document.createElement('div');
+  row.className = 'item';
+  row.innerHTML = '<div class="name"></div><progress value="0" max="100"></progress><div class="st">Waiting...</div>';
+  row.querySelector('.name').textContent = f.name;
+  list.appendChild(row);
+  const stEl = row.querySelector('.st');
+  return {
+    bar: row.querySelector('progress'),
+    say: (t, cls) => { stEl.textContent = t; stEl.className = 'st ' + (cls || ''); },
+  };
+}
+
 document.getElementById('f').addEventListener('submit', async (e) => {
   e.preventDefault();
-  if (!file.files.length) return;
-  const f = file.files[0];
-  pw.style.display = 'block';
+  if (busy || !file.files.length) return;
+  // Drop duplicates in the selection (they share an upload id on the server)
+  // and files a previous attempt already saved.
+  const seen = new Set();
+  const files = Array.from(file.files).filter((f) => {
+    const k = fileKey(f);
+    return !completed.has(k) && !seen.has(k) && seen.add(k);
+  });
+  if (!files.length) {
+    st.className = 'ok';
+    st.textContent = 'These files were already uploaded.';
+    return;
+  }
+  busy = true;
+  list.textContent = '';
   btn.disabled = true;
   st.className = '';
   st.textContent = 'Uploading... do not leave or lock this page.';
@@ -164,21 +196,38 @@ document.getElementById('f').addEventListener('submit', async (e) => {
   if (navigator.wakeLock) {
     navigator.wakeLock.request('screen').then(l => wakeLock = l).catch(() => {});
   }
-  try {
-    await upload(f);
-    st.className = 'ok';
-    st.textContent = 'Upload complete!';
-    file.value = '';
-    lbl.textContent = 'Tap here to choose a file';
-    lbl.classList.remove('has-file');
-  } catch (err) {
+  const rows = files.map(addRow);
+  const failed = [];
+  let next = 0;
+  async function worker() {
+    while (next < files.length) {
+      const i = next++;
+      const { bar, say } = rows[i];
+      say('Uploading...');
+      try {
+        await upload(files[i], bar, say);
+        completed.add(fileKey(files[i]));
+        bar.value = 100;
+        say('Done', 'ok');
+      } catch (err) {
+        say('Failed: ' + err.message, 'err');
+        failed.push(files[i].name);
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(PARALLEL, files.length) }, worker));
+  if (failed.length) {
     st.className = 'err';
-    st.textContent = 'Upload failed: ' + err.message + ' (select the same file again to resume)';
-    btn.disabled = false;
+    st.textContent = failed.length + ' of ' + files.length + ' failed (select them again to resume)';
+  } else {
+    st.className = 'ok';
+    st.textContent = files.length === 1 ? 'Upload complete!' : 'All ' + files.length + ' files uploaded!';
+    file.value = '';
+    lbl.textContent = 'Tap here to choose files';
+    lbl.classList.remove('has-file');
   }
   if (wakeLock) wakeLock.release();
-  pw.style.display = 'none';
-  bar.value = 0;
+  busy = false;
   btn.disabled = !file.files.length;
 });
 </script>
@@ -287,6 +336,7 @@ type upload struct {
 var (
 	uploadsMu sync.Mutex
 	uploads   = map[string]*upload{}
+	finishMu  sync.Mutex // serializes picking a free name and renaming into it
 )
 
 func (u *upload) partPath() string {
@@ -307,8 +357,11 @@ func getUpload(id string) *upload {
 
 // finish moves the completed temp file to its final, non-colliding name.
 func (u *upload) finish() error {
+	finishMu.Lock()
 	finalPath := uniquePath(downloadDir, u.name)
-	if err := os.Rename(u.partPath(), finalPath); err != nil {
+	err := os.Rename(u.partPath(), finalPath)
+	finishMu.Unlock()
+	if err != nil {
 		return err
 	}
 	uploadsMu.Lock()

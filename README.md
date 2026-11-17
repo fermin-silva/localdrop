@@ -36,7 +36,7 @@ This will:
 2. Start an HTTP server on a random available port
 3. Print a QR code you can scan with your phone
 
-Open the URL on your phone (must be on the same Wi-Fi network), pick a file, and hit Upload.
+Open the URL on your phone (must be on the same Wi-Fi network), pick one or more files, and hit Upload (up to 3 upload in parallel).
 
 Files are saved to the `localdrop_downloads/` folder in the current directory.
 
