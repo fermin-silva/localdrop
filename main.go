@@ -53,11 +53,15 @@ button {
   display: block; width: 100%; padding: 16px; font-size: 18px;
   background: #4caf50; color: #fff; border: none; border-radius: 8px; cursor: pointer;
 }
+.file-box.drag { border-color: #4caf50; background: #e8f5e9; }
 button:disabled { background: #aaa; }
 #list { max-width: 400px; margin: 16px auto 0; }
 .item { background: #fff; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
 .item .name { font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.item progress { width: 100%; height: 12px; margin-top: 6px; }
+.item .bar-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.item progress { flex: 1; height: 12px; }
+.item .x { background: none; color: #999; border: none; padding: 0 4px; font-size: 20px; line-height: 1; cursor: pointer; }
+.item .x:disabled { visibility: hidden; }
 .item .st { font-size: 13px; color: #666; margin-top: 4px; }
 #status { text-align: center; margin-top: 16px; font-size: 16px; }
 .ok { color: #4caf50; } .err { color: #e53935; }
@@ -83,7 +87,6 @@ const btn = document.getElementById('btn');
 const list = document.getElementById('list');
 const st = document.getElementById('status');
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const fileKey = (f) => f.name + '|' + f.size + '|' + f.lastModified;
 const completed = new Set(); // files already saved, so a retry doesn't upload them again
 let busy = false;
@@ -97,10 +100,16 @@ file.addEventListener('change', () => {
   }
 });
 
+const cancelError = () => Object.assign(new Error('Cancelled'), { fatal: true, cancelled: true });
+
 // api resolves with {status, data} for any HTTP response and rejects on network errors.
-function api(method, url, body, onProgress) {
+// ctl.cancel() aborts the request in flight.
+function api(ctl, method, url, body, onProgress) {
   return new Promise((resolve, reject) => {
+    if (ctl.cancelled) return reject(cancelError());
     const xhr = new XMLHttpRequest();
+    ctl.abort = () => xhr.abort();
+    xhr.onabort = () => reject(cancelError());
     xhr.open(method, url);
     if (onProgress) xhr.upload.onprogress = onProgress;
     xhr.onload = () => {
@@ -113,14 +122,26 @@ function api(method, url, body, onProgress) {
   });
 }
 
-async function upload(f, bar, say) {
+// cancellable sleep: resolves early when ctl.cancel() is called.
+function pause(ctl, ms) {
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    ctl.abort = () => { clearTimeout(t); resolve(); };
+  });
+}
+
+// upload sends f in chunks. Cancelling leaves the partial file on the server,
+// so sending the same file again resumes where it stopped.
+async function upload(f, bar, say, ctl) {
   const q = new URLSearchParams({ name: f.name, size: f.size, mtime: f.lastModified });
   let id = null, offset = 0, done = false, fails = 0;
   while (!done) {
+    if (ctl.cancelled) throw cancelError();
     try {
       if (id === null) {
-        const r = await api('POST', '/upload/init?' + q);
-        if (r.status !== 200) throw Object.assign(new Error(r.text), { fatal: r.status < 500 });
+        const r = await api(ctl, 'POST', '/upload/init?' + q);
+        // 423: a cancelled request for this file is still winding down on the server.
+        if (r.status !== 200) throw Object.assign(new Error(r.text), { fatal: r.status < 500 && r.status !== 423 });
         id = r.data.id;
         offset = r.data.offset;
         done = r.data.done;
@@ -130,7 +151,7 @@ async function upload(f, bar, say) {
       }
       const end = Math.min(offset + CHUNK, f.size);
       const base = offset;
-      const r = await api('PUT', '/upload/chunk?id=' + id + '&offset=' + offset, f.slice(offset, end), (ev) => {
+      const r = await api(ctl, 'PUT', '/upload/chunk?id=' + id + '&offset=' + offset, f.slice(offset, end), (ev) => {
         if (ev.lengthComputable) bar.value = ((base + ev.loaded) / f.size) * 100;
       });
       if (r.status === 200) {
@@ -148,10 +169,11 @@ async function upload(f, bar, say) {
     } catch (err) {
       if (err.fatal || ++fails > MAX_RETRIES) throw err;
       say('Connection problem, retrying (' + fails + '/' + MAX_RETRIES + ')...');
-      await sleep(Math.min(1000 * 2 ** (fails - 1), 10000));
+      await pause(ctl, Math.min(1000 * 2 ** (fails - 1), 10000));
+      if (ctl.cancelled) throw cancelError();
       if (id !== null) {
         try {
-          const r = await api('GET', '/upload/offset?id=' + id);
+          const r = await api(ctl, 'GET', '/upload/offset?id=' + id);
           if (r.status === 200) offset = r.data.offset;
         } catch (e) {}
       }
@@ -162,15 +184,33 @@ async function upload(f, bar, say) {
 function addRow(f) {
   const row = document.createElement('div');
   row.className = 'item';
-  row.innerHTML = '<div class="name"></div><progress value="0" max="100"></progress><div class="st">Waiting...</div>';
+  row.innerHTML = '<div class="name"></div><div class="bar-row"><progress value="0" max="100"></progress>' +
+    '<button type="button" class="x" title="Cancel upload">&times;</button></div><div class="st">Waiting...</div>';
   row.querySelector('.name').textContent = f.name;
   list.appendChild(row);
   const stEl = row.querySelector('.st');
+  const x = row.querySelector('.x');
+  const ctl = { cancelled: false, abort: () => {} };
+  ctl.cancel = () => { ctl.cancelled = true; x.disabled = true; ctl.abort(); };
+  x.addEventListener('click', ctl.cancel);
   return {
     bar: row.querySelector('progress'),
     say: (t, cls) => { stEl.textContent = t; stEl.className = 'st ' + (cls || ''); },
+    ctl,
+    finished: () => { x.disabled = true; },
   };
 }
+
+// Without this the browser opens a dropped file instead of uploading it.
+window.addEventListener('dragover', (e) => { e.preventDefault(); lbl.classList.add('drag'); });
+window.addEventListener('dragleave', (e) => { if (!e.relatedTarget) lbl.classList.remove('drag'); });
+window.addEventListener('drop', (e) => {
+  e.preventDefault();
+  lbl.classList.remove('drag');
+  if (busy || !e.dataTransfer.files.length) return;
+  file.files = e.dataTransfer.files;
+  file.dispatchEvent(new Event('change'));
+});
 
 document.getElementById('f').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -198,27 +238,38 @@ document.getElementById('f').addEventListener('submit', async (e) => {
   }
   const rows = files.map(addRow);
   const failed = [];
+  let cancelled = 0;
   let next = 0;
   async function worker() {
     while (next < files.length) {
       const i = next++;
-      const { bar, say } = rows[i];
-      say('Uploading...');
+      const { bar, say, ctl, finished } = rows[i];
       try {
-        await upload(files[i], bar, say);
+        if (ctl.cancelled) throw cancelError(); // cancelled while waiting in the queue
+        say('Uploading...');
+        await upload(files[i], bar, say, ctl);
         completed.add(fileKey(files[i]));
         bar.value = 100;
         say('Done', 'ok');
       } catch (err) {
-        say('Failed: ' + err.message, 'err');
-        failed.push(files[i].name);
+        if (err.cancelled) {
+          say('Cancelled (send it again to resume)', 'err');
+          cancelled++;
+        } else {
+          say('Failed: ' + err.message, 'err');
+          failed.push(files[i].name);
+        }
       }
+      finished();
     }
   }
   await Promise.all(Array.from({ length: Math.min(PARALLEL, files.length) }, worker));
-  if (failed.length) {
+  if (failed.length || cancelled) {
+    const parts = [];
+    if (failed.length) parts.push(failed.length + ' failed');
+    if (cancelled) parts.push(cancelled + ' cancelled');
     st.className = 'err';
-    st.textContent = failed.length + ' of ' + files.length + ' failed (select them again to resume)';
+    st.textContent = parts.join(', ') + ' of ' + files.length + ' (select them again to resume)';
   } else {
     st.className = 'ok';
     st.textContent = files.length === 1 ? 'Upload complete!' : 'All ' + files.length + ' files uploaded!';
@@ -283,45 +334,33 @@ func uniquePath(dir, filename string) string {
 	}
 }
 
-type progressWriter struct {
-	dst      io.Writer
-	bytes    atomic.Int64
-	done     chan struct{}
-	filename string
-}
+// received counts bytes written by all chunk uploads; logReceived reports the
+// aggregate rate, since a single chunk usually finishes before one tick.
+var received atomic.Int64
 
-func newProgressWriter(dst io.Writer, filename string) *progressWriter {
-	pw := &progressWriter{dst: dst, filename: filename, done: make(chan struct{})}
-	go pw.logLoop()
-	return pw
-}
+type countingWriter struct{ dst io.Writer }
 
-func (pw *progressWriter) Write(p []byte) (int, error) {
-	n, err := pw.dst.Write(p)
-	pw.bytes.Add(int64(n))
+func (cw countingWriter) Write(p []byte) (int, error) {
+	n, err := cw.dst.Write(p)
+	received.Add(int64(n))
 	return n, err
 }
 
-func (pw *progressWriter) logLoop() {
-	ticker := time.NewTicker(5 * time.Second)
+func logReceived() {
+	const interval = 5 * time.Second
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	var last int64
-	for {
-		select {
-		case <-ticker.C:
-			current := pw.bytes.Load()
-			delta := current - last
-			last = current
-			mbps := float64(delta) * 8 / 5 / 1_000_000
-			fmt.Printf("  %s: %.1f MB received, %.1f Mbps\n", pw.filename, float64(current)/1_000_000, mbps)
-		case <-pw.done:
-			return
+	for range ticker.C {
+		current := received.Load()
+		delta := current - last
+		last = current
+		if delta == 0 {
+			continue
 		}
+		mbps := float64(delta) * 8 / interval.Seconds() / 1_000_000
+		fmt.Printf("  %.1f MB received, %.1f Mbps\n", float64(current)/1_000_000, mbps)
 	}
-}
-
-func (pw *progressWriter) stop() {
-	close(pw.done)
 }
 
 const chunkSize = 32 << 20
@@ -486,9 +525,7 @@ func handleChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pw := newProgressWriter(f, u.name)
-	n, err := io.Copy(pw, http.MaxBytesReader(w, r.Body, r.ContentLength))
-	pw.stop()
+	n, err := io.Copy(countingWriter{f}, http.MaxBytesReader(w, r.Body, r.ContentLength))
 	if err != nil || n != r.ContentLength {
 		// Whatever reached the disk stays; the client re-queries the offset and continues.
 		http.Error(w, "error saving chunk", http.StatusInternalServerError)
@@ -539,6 +576,7 @@ func main() {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprint(w, uploadHTML)
 	})
+	go logReceived()
 	http.HandleFunc("POST /upload/init", handleInit)
 	http.HandleFunc("GET /upload/offset", handleOffset)
 	http.HandleFunc("PUT /upload/chunk", handleChunk)
