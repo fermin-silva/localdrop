@@ -62,8 +62,10 @@ button:disabled { background: #aaa; }
 .item progress { flex: 1; height: 12px; }
 .item .x { background: none; color: #999; border: none; padding: 0 4px; font-size: 20px; line-height: 1; cursor: pointer; }
 .item .x:disabled { visibility: hidden; }
-.item .st { font-size: 13px; color: #666; margin-top: 4px; }
+.item .st-row { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; color: #666; margin-top: 4px; }
+.item .spd { white-space: nowrap; font-variant-numeric: tabular-nums; }
 #status { text-align: center; margin-top: 16px; font-size: 16px; }
+#speed { text-align: center; margin-top: 6px; font-size: 14px; color: #666; font-variant-numeric: tabular-nums; }
 .ok { color: #4caf50; } .err { color: #e53935; }
 </style>
 </head>
@@ -77,6 +79,7 @@ button:disabled { background: #aaa; }
 </form>
 <div id="list"></div>
 <div id="status"></div>
+<div id="speed" class="sub"></div>
 <script>
 const CHUNK = 32 * 1024 * 1024;
 const MAX_RETRIES = 8;
@@ -86,6 +89,29 @@ const lbl = document.getElementById('lbl');
 const btn = document.getElementById('btn');
 const list = document.getElementById('list');
 const st = document.getElementById('status');
+const speedEl = document.getElementById('speed');
+
+// mbps formats a byte rate as megabits per second, like the server log.
+const mbps = (bytes, secs) => (secs > 0 ? (bytes * 8 / secs / 1e6).toFixed(1) : '0.0') + ' Mbps';
+const mb = (bytes) => (bytes / 1e6).toFixed(1) + ' MB';
+
+let audio = null;
+
+// chime plays a short two-note beep when a file finishes.
+function chime() {
+  if (!audio) return;
+  const t = audio.currentTime;
+  [880, 1320].forEach((freq, i) => {
+    const osc = audio.createOscillator();
+    const gain = audio.createGain();
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.2, t + i * 0.15);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + i * 0.15 + 0.3);
+    osc.connect(gain).connect(audio.destination);
+    osc.start(t + i * 0.15);
+    osc.stop(t + i * 0.15 + 0.3);
+  });
+}
 
 const fileKey = (f) => f.name + '|' + f.size + '|' + f.lastModified;
 const completed = new Set(); // files already saved, so a retry doesn't upload them again
@@ -132,7 +158,7 @@ function pause(ctl, ms) {
 
 // upload sends f in chunks. Cancelling leaves the partial file on the server,
 // so sending the same file again resumes where it stopped.
-async function upload(f, bar, say, ctl) {
+async function upload(f, bar, say, ctl, track) {
   const q = new URLSearchParams({ name: f.name, size: f.size, mtime: f.lastModified });
   let id = null, offset = 0, done = false, fails = 0;
   while (!done) {
@@ -151,7 +177,10 @@ async function upload(f, bar, say, ctl) {
       }
       const end = Math.min(offset + CHUNK, f.size);
       const base = offset;
+      let sent = 0;
       const r = await api(ctl, 'PUT', '/upload/chunk?id=' + id + '&offset=' + offset, f.slice(offset, end), (ev) => {
+        track(ev.loaded - sent);
+        sent = ev.loaded;
         if (ev.lengthComputable) bar.value = ((base + ev.loaded) / f.size) * 100;
       });
       if (r.status === 200) {
@@ -185,11 +214,13 @@ function addRow(f) {
   const row = document.createElement('div');
   row.className = 'item';
   row.innerHTML = '<div class="name"></div><div class="bar-row"><progress value="0" max="100"></progress>' +
-    '<button type="button" class="x" title="Cancel upload">&times;</button></div><div class="st">Waiting...</div>';
+    '<button type="button" class="x" title="Cancel upload">&times;</button></div>' +
+    '<div class="st-row"><span class="st">Waiting...</span><span class="spd"></span></div>';
   row.querySelector('.name').textContent = f.name;
   list.appendChild(row);
   const stEl = row.querySelector('.st');
   const x = row.querySelector('.x');
+  const spdEl = row.querySelector('.spd');
   const ctl = { cancelled: false, abort: () => {} };
   ctl.cancel = () => { ctl.cancelled = true; x.disabled = true; ctl.abort(); };
   x.addEventListener('click', ctl.cancel);
@@ -198,6 +229,11 @@ function addRow(f) {
     say: (t, cls) => { stEl.textContent = t; stEl.className = 'st ' + (cls || ''); },
     ctl,
     finished: () => { x.disabled = true; },
+    speed: (t) => { spdEl.textContent = t; },
+    sent: 0,     // bytes sent this session
+    lastSent: 0, // value of sent at the previous speed tick
+    start: 0,    // when this file started sending
+    active: false,
   };
 }
 
@@ -228,6 +264,8 @@ document.getElementById('f').addEventListener('submit', async (e) => {
     return;
   }
   busy = true;
+  // Browsers only allow audio after a user gesture, so create it on submit.
+  if (!audio && window.AudioContext) audio = new AudioContext();
   list.textContent = '';
   btn.disabled = true;
   st.className = '';
@@ -237,20 +275,36 @@ document.getElementById('f').addEventListener('submit', async (e) => {
     navigator.wakeLock.request('screen').then(l => wakeLock = l).catch(() => {});
   }
   const rows = files.map(addRow);
+  const startedAt = performance.now();
+  let totalSent = 0, lastTotal = 0;
+  const TICK = 1000;
+  const ticker = setInterval(() => {
+    for (const row of rows) {
+      if (!row.active) continue;
+      row.speed(mbps(row.sent - row.lastSent, TICK / 1000));
+      row.lastSent = row.sent;
+    }
+    speedEl.textContent = 'Total: ' + mb(totalSent) + ' at ' + mbps(totalSent - lastTotal, TICK / 1000);
+    lastTotal = totalSent;
+  }, TICK);
   const failed = [];
   let cancelled = 0;
   let next = 0;
   async function worker() {
     while (next < files.length) {
       const i = next++;
-      const { bar, say, ctl, finished } = rows[i];
+      const row = rows[i];
+      const { bar, say, ctl, finished } = row;
       try {
         if (ctl.cancelled) throw cancelError(); // cancelled while waiting in the queue
         say('Uploading...');
-        await upload(files[i], bar, say, ctl);
+        row.start = performance.now();
+        row.active = true;
+        await upload(files[i], bar, say, ctl, (n) => { row.sent += n; totalSent += n; });
         completed.add(fileKey(files[i]));
         bar.value = 100;
         say('Done', 'ok');
+        chime();
       } catch (err) {
         if (err.cancelled) {
           say('Cancelled (send it again to resume)', 'err');
@@ -260,10 +314,16 @@ document.getElementById('f').addEventListener('submit', async (e) => {
           failed.push(files[i].name);
         }
       }
+      if (row.active) {
+        row.active = false;
+        row.speed(row.sent ? 'avg ' + mbps(row.sent, (performance.now() - row.start) / 1000) : '');
+      }
       finished();
     }
   }
   await Promise.all(Array.from({ length: Math.min(PARALLEL, files.length) }, worker));
+  clearInterval(ticker);
+  speedEl.textContent = 'Total: ' + mb(totalSent) + ', avg ' + mbps(totalSent, (performance.now() - startedAt) / 1000);
   if (failed.length || cancelled) {
     const parts = [];
     if (failed.length) parts.push(failed.length + ' failed');
@@ -338,12 +398,24 @@ func uniquePath(dir, filename string) string {
 // aggregate rate, since a single chunk usually finishes before one tick.
 var received atomic.Int64
 
-type countingWriter struct{ dst io.Writer }
+// countingWriter counts bytes both globally and for its upload.
+type countingWriter struct {
+	dst io.Writer
+	u   *upload
+}
 
 func (cw countingWriter) Write(p []byte) (int, error) {
 	n, err := cw.dst.Write(p)
 	received.Add(int64(n))
+	cw.u.received.Add(int64(n))
 	return n, err
+}
+
+func mbps(bytes int64, d time.Duration) float64 {
+	if d <= 0 {
+		return 0
+	}
+	return float64(bytes) * 8 / d.Seconds() / 1_000_000
 }
 
 func logReceived() {
@@ -358,8 +430,19 @@ func logReceived() {
 		if delta == 0 {
 			continue
 		}
-		mbps := float64(delta) * 8 / interval.Seconds() / 1_000_000
-		fmt.Printf("  %.1f MB received, %.1f Mbps\n", float64(current)/1_000_000, mbps)
+		fmt.Printf("  Total: %.1f MB received, %.1f Mbps\n", float64(current)/1_000_000, mbps(delta, interval))
+
+		uploadsMu.Lock()
+		for _, u := range uploads {
+			cur := u.received.Load()
+			d := cur - u.lastLogged
+			u.lastLogged = cur
+			if d == 0 {
+				continue
+			}
+			fmt.Printf("    %s: %.1f Mbps\n", u.name, mbps(d, interval))
+		}
+		uploadsMu.Unlock()
 	}
 }
 
@@ -370,6 +453,10 @@ type upload struct {
 	name string
 	size int64
 	mu   sync.Mutex // held while a chunk is being written
+
+	received   atomic.Int64 // bytes received since this server started
+	started    atomic.Int64 // unix nanos of the first chunk, 0 until then
+	lastLogged int64        // received at the previous log tick; guarded by uploadsMu
 }
 
 var (
@@ -406,7 +493,12 @@ func (u *upload) finish() error {
 	uploadsMu.Lock()
 	delete(uploads, u.id)
 	uploadsMu.Unlock()
-	fmt.Printf("Saved: %s (%.1f MB)\n", finalPath, float64(u.size)/1_000_000)
+	if start := u.started.Load(); start != 0 {
+		fmt.Printf("\aSaved: %s (%.1f MB, avg %.1f Mbps)\n", finalPath, float64(u.size)/1_000_000,
+			mbps(u.received.Load(), time.Since(time.Unix(0, start))))
+	} else {
+		fmt.Printf("\aSaved: %s (%.1f MB)\n", finalPath, float64(u.size)/1_000_000)
+	}
 	return nil
 }
 
@@ -525,7 +617,8 @@ func handleChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	n, err := io.Copy(countingWriter{f}, http.MaxBytesReader(w, r.Body, r.ContentLength))
+	u.started.CompareAndSwap(0, time.Now().UnixNano())
+	n, err := io.Copy(countingWriter{f, u}, http.MaxBytesReader(w, r.Body, r.ContentLength))
 	if err != nil || n != r.ContentLength {
 		// Whatever reached the disk stays; the client re-queries the offset and continues.
 		http.Error(w, "error saving chunk", http.StatusInternalServerError)
@@ -566,6 +659,7 @@ func main() {
 	qrterminal.GenerateWithConfig(url, cfg)
 
 	fmt.Println("\nScan the QR code with your phone to upload files.")
+	fmt.Printf("Can't scan the QR code? Open this address in your phone's browser instead:\n  %s\n", url)
 	fmt.Println("Press Ctrl+C to stop.\n")
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
